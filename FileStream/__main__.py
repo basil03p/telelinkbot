@@ -49,7 +49,8 @@ async def start_services():
     log.info('------------------------------ DONE ------------------------------')
 
     log.info('--------------------- Initializing Web Server ---------------------')
-    app = web.AppRunner(await web_server())
+    # Fix: Don't use await with web_server() if it returns an Application object rather than a coroutine
+    app = web.AppRunner(web_server())
     await app.setup()
     bind_address = "0.0.0.0"
     await web.TCPSite(app, bind_address, Server.PORT).start()
