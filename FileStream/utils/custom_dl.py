@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Dict, Union
 from FileStream.bot import work_loads
 from pyrogram import Client, utils, raw
@@ -11,27 +12,73 @@ from pyrogram.types import Message
 
 class ByteStreamer:
     def __init__(self, client: Client):
-        self.clean_timer = 30 * 60
+        self.clean_timer = 60 * 10  # Reduced cache time to 10 minutes
         self.client: Client = client
         self.cached_file_ids: Dict[str, FileId] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._session_locks: Dict[int, asyncio.Lock] = {}
+        self._session_retries: Dict[int, int] = {}
+        self._max_retries = 3
+        self._last_usage: Dict[str, float] = {}  # Track when each file was last accessed
+        self._max_cache_size = 25  # Maximum number of items in cache
         asyncio.create_task(self.clean_cache())
+
+    def get_lock(self, key: str) -> asyncio.Lock:
+        """Get a lock for a specific file ID to prevent concurrent access"""
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
+        
+    def get_session_lock(self, dc_id: int) -> asyncio.Lock:
+        """Get a lock for a specific DC to prevent concurrent session operations"""
+        if dc_id not in self._session_locks:
+            self._session_locks[dc_id] = asyncio.Lock()
+        return self._session_locks[dc_id]
 
     async def get_file_properties(self, db_id: str, multi_clients) -> FileId:
         """
-        Returns the properties of a media of a specific message in a FIleId class.
-        if the properties are cached, then it'll return the cached results.
-        or it'll generate the properties from the Message ID and cache them.
+        Returns the properties of a media of a specific message in a FileId class.
+        with optimized caching for Koyeb free tier.
         """
-        if not db_id in self.cached_file_ids:
-            logging.debug("Before Calling generate_file_properties")
-            await self.generate_file_properties(db_id, multi_clients)
-            logging.debug(f"Cached file properties for file with ID {db_id}")
-        return self.cached_file_ids[db_id]
+        async with self.get_lock(db_id):
+            # Update last usage time whenever a file is accessed
+            self._last_usage[db_id] = time.time()
+            
+            # Check if we need to trim the cache
+            if len(self.cached_file_ids) > self._max_cache_size:
+                await self._trim_cache()
+                
+            if db_id not in self.cached_file_ids:
+                await self.generate_file_properties(db_id, multi_clients)
+                
+            return self.cached_file_ids[db_id]
+    
+    async def _trim_cache(self):
+        """Remove oldest items from cache when it gets too large"""
+        if not self._last_usage:
+            return
+            
+        # Find the oldest items
+        sorted_items = sorted(self._last_usage.items(), key=lambda x: x[1])
+        items_to_remove = len(self.cached_file_ids) - self._max_cache_size
+        
+        if items_to_remove <= 0:
+            return
+            
+        # Remove oldest items
+        for i in range(min(items_to_remove, len(sorted_items))):
+            key = sorted_items[i][0]
+            if key in self.cached_file_ids:
+                self.cached_file_ids.pop(key)
+            if key in self._last_usage:
+                self._last_usage.pop(key)
+            if key in self._locks:
+                self._locks.pop(key)
     
     async def generate_file_properties(self, db_id: str, multi_clients) -> FileId:
         """
         Generates the properties of a media file on a specific message.
-        returns ths properties in a FIleId class.
+        returns the properties in a FileId class.
         """
         logging.debug("Before calling get_file_ids")
         file_id = await get_file_ids(self.client, db_id, multi_clients, Message)
@@ -43,58 +90,70 @@ class ByteStreamer:
     async def generate_media_session(self, client: Client, file_id: FileId) -> Session:
         """
         Generates the media session for the DC that contains the media file.
-        This is required for getting the bytes from Telegram servers.
+        Optimized for Koyeb free tier with better error handling.
         """
+        dc_id = file_id.dc_id
+        async with self.get_session_lock(dc_id):
+            media_session = client.media_sessions.get(dc_id, None)
 
-        media_session = client.media_sessions.get(file_id.dc_id, None)
+            # Check if session exists and is healthy with a simple check
+            if media_session is not None:
+                try:
+                    # Simple faster check
+                    if hasattr(media_session, '_is_connected') and media_session._is_connected:
+                        return media_session
+                except:
+                    # Session unreachable
+                    client.media_sessions.pop(dc_id, None)
+                    media_session = None
 
-        if media_session is None:
-            if file_id.dc_id != await client.storage.dc_id():
-                media_session = Session(
-                    client,
-                    file_id.dc_id,
-                    await Auth(
-                        client, file_id.dc_id, await client.storage.test_mode()
-                    ).create(),
-                    await client.storage.test_mode(),
-                    is_media=True,
-                )
-                await media_session.start()
+            if media_session is None:
+                retry_count = self._session_retries.get(dc_id, 0)
+                if retry_count >= self._max_retries:
+                    self._session_retries[dc_id] = 0  # Reset for future attempts
+                    raise RuntimeError(f"Failed to create media session after {self._max_retries} attempts")
+                
+                self._session_retries[dc_id] = retry_count + 1
+                
+                try:
+                    # Simplified session creation with fewer retries
+                    if dc_id != await client.storage.dc_id():
+                        media_session = Session(
+                            client,
+                            dc_id,
+                            await Auth(client, dc_id, await client.storage.test_mode()).create(),
+                            await client.storage.test_mode(),
+                            is_media=True,
+                        )
+                        await media_session.start()
 
-                for _ in range(6):
-                    exported_auth = await client.invoke(
-                        raw.functions.auth.ExportAuthorization(dc_id=file_id.dc_id)
-                    )
+                        # Try to import authorization - single attempt to save resources
+                        exported_auth = await client.invoke(
+                            raw.functions.auth.ExportAuthorization(dc_id=dc_id)
+                        )
 
-                    try:
                         await media_session.invoke(
                             raw.functions.auth.ImportAuthorization(
                                 id=exported_auth.id, bytes=exported_auth.bytes
                             )
                         )
-                        break
-                    except AuthBytesInvalid:
-                        logging.debug(
-                            f"Invalid authorization bytes for DC {file_id.dc_id}"
+                    else:
+                        media_session = Session(
+                            client,
+                            dc_id,
+                            await client.storage.auth_key(),
+                            await client.storage.test_mode(),
+                            is_media=True,
                         )
-                        continue
-                else:
-                    await media_session.stop()
-                    raise AuthBytesInvalid
-            else:
-                media_session = Session(
-                    client,
-                    file_id.dc_id,
-                    await client.storage.auth_key(),
-                    await client.storage.test_mode(),
-                    is_media=True,
-                )
-                await media_session.start()
-            logging.debug(f"Created media session for DC {file_id.dc_id}")
-            client.media_sessions[file_id.dc_id] = media_session
-        else:
-            logging.debug(f"Using cached media session for DC {file_id.dc_id}")
-        return media_session
+                        await media_session.start()
+                    
+                    client.media_sessions[dc_id] = media_session
+                    
+                except Exception as e:
+                    logging.error(f"Failed to create media session: {str(e)}")
+                    raise
+            
+            return media_session
 
 
     @staticmethod
@@ -154,61 +213,93 @@ class ByteStreamer:
     ) -> Union[str, None]:
         """
         Custom generator that yields the bytes of the media file.
-        Modded from <https://github.com/eyaadh/megadlbot_oss/blob/master/mega/telegram/utils/custom_download.py#L20>
-        Thanks to Eyaadh <https://github.com/eyaadh>
+        Optimized for Koyeb free tier.
         """
         client = self.client
         work_loads[index] += 1
-        logging.debug(f"Starting to yielding file with client {index}.")
-        media_session = await self.generate_media_session(client, file_id)
-
+        
         current_part = 1
-
-        location = await self.get_location(file_id)
-
+        retry_count = 0
+        max_retries = 2  # Reduced retries to save resources
+        
         try:
-            r = await media_session.invoke(
-                raw.functions.upload.GetFile(
-                    location=location, offset=offset, limit=chunk_size
-                ),
-            )
-            if isinstance(r, raw.types.upload.File):
-                while True:
-                    chunk = r.bytes
-                    if not chunk:
-                        break
-                    elif part_count == 1:
-                        yield chunk[first_part_cut:last_part_cut]
-                    elif current_part == 1:
-                        yield chunk[first_part_cut:]
-                    elif current_part == part_count:
-                        yield chunk[:last_part_cut]
-                    else:
-                        yield chunk
-
-                    current_part += 1
-                    offset += chunk_size
-
-                    if current_part > part_count:
-                        break
-
-                    r = await media_session.invoke(
-                        raw.functions.upload.GetFile(
-                            location=location, offset=offset, limit=chunk_size
+            media_session = await self.generate_media_session(client, file_id)
+            location = await self.get_location(file_id)
+            
+            while current_part <= part_count and retry_count < max_retries:
+                try:
+                    # Simple timeout handling
+                    r = await asyncio.wait_for(
+                        media_session.invoke(
+                            raw.functions.upload.GetFile(
+                                location=location,
+                                offset=offset,
+                                limit=chunk_size
+                            )
                         ),
+                        timeout=20  # Reasonable timeout for Koyeb
                     )
-        except (TimeoutError, AttributeError):
-            pass
-        finally:
-            logging.debug(f"Finished yielding file with {current_part} parts.")
-            work_loads[index] -= 1
+                    
+                    if isinstance(r, raw.types.upload.File):
+                        chunk = r.bytes
+                        if not chunk:
+                            break
+                            
+                        if part_count == 1:
+                            yield chunk[first_part_cut:last_part_cut]
+                        elif current_part == 1:
+                            yield chunk[first_part_cut:]
+                        elif current_part == part_count:
+                            yield chunk[:last_part_cut]
+                        else:
+                            yield chunk
 
+                        current_part += 1
+                        offset += chunk_size
+                        
+                        if current_part > part_count:
+                            break
+                            
+                    else:
+                        retry_count += 1
+                        await asyncio.sleep(1)
+                        
+                except (asyncio.TimeoutError, TimeoutError) as e:
+                    retry_count += 1
+                    await asyncio.sleep(1)
+                    
+                except Exception as e:
+                    logging.error(f"Error getting chunk: {str(e)}")
+                    retry_count += 1
+                    await asyncio.sleep(1)
+                
+        except Exception as e:
+            logging.error(f"Error in yield_file: {str(e)}")
+        finally:
+            work_loads[index] -= 1
     
     async def clean_cache(self) -> None:
         """
-        function to clean the cache to reduce memory usage
+        Function to clean the cache to reduce memory usage.
+        Optimized for Koyeb free tier.
         """
         while True:
             await asyncio.sleep(self.clean_timer)
-            self.cached_file_ids.clear()
-            logging.debug("Cleaned the cache")
+            
+            # Keep only recently used files based on _last_usage
+            current_time = time.time()
+            inactive_files = []
+            
+            for db_id, last_used in self._last_usage.items():
+                if current_time - last_used > self.clean_timer:
+                    inactive_files.append(db_id)
+                    
+            for db_id in inactive_files:
+                if db_id in self.cached_file_ids:
+                    self.cached_file_ids.pop(db_id)
+                if db_id in self._last_usage:
+                    self._last_usage.pop(db_id)
+                if db_id in self._locks:
+                    self._locks.pop(db_id)
+                    
+            logging.debug(f"Cleaned {len(inactive_files)} files from cache")
